@@ -1,0 +1,393 @@
+---
+title: "id_matching"
+author: "Martin"
+date: "June 9, 2017"
+output: html_document
+---
+# Matching ID's
+
+## Requirements
+
+ - Input .csv file with missing CRM ID's. There can be other columns but at minimum file must contain: "CRM.ID", "First.Name", "Last.Name", "Year", "Program", "Email".
+ -SQL 
+
+
+## Loading some libraries
+If you recieve the error "there is no package called X" use install.packages("x") before calling library(x). For example, if you see "there is no package called'RODBC'" when executing the library function, first use install.packages('RODBC') to install the package/library to your machine.
+
+If you want to install all 5 packages at once uncomment the first line.
+
+```{r load_libraries, message=FALSE}
+#install.packages(c(RODBC, reshape2, stringdist, kplyr, plyr))
+library(RODBC) #Connect and query to external SQL Server
+library(reshape2) #For dataframe casting and melting
+library(stringdist) #Computing string similarities for names
+library(plyr) #reshaping data
+library(dplyr) #reshaping data
+library(knitr) #html tables
+
+```
+
+```{r set_variables}
+resultsDirectory <- "K:\\Ard\\Alumni Relations\\Data Management\\Non-OAR Alumni Engagement\\id_matching\\2017"
+wd <- "K:\\Ard\\Alumni Relations\\Data Management\\Non-OAR Alumni Engagement\\2017\\id_matching"
+fileName <- "allAttendees"
+resultFileName <- "id_matches_q1_events"
+allDegreesExtract <- "AndersonAllDegreeandRevenueExtract_20170609.csv"
+```
+
+## Importing and Formatting Attendee Data
+The attendee data is stored in a .csv file in "K:\\Ard\\Alumni Relations\\Data Management\\Non-OAR Alumni Engagement\\YYYY\\id_matching", where "YYYY" is the year of the events attendees went to. The columns in the master attendee file are
+
+Event.Type|Event.Name|Event.Date  |  Event.Location | Host.Group | Contact | CRM.ID | First.Name | Last.Name | Year | Program | Email | Registration.Type|Attended|Type.of.Engagement|Comment |
+
+We'll read the data to two dataframes: 1 with all attendees whose CRM.ID needs to be looked for -- named 'unfound' -- and another named 'found' that has the attendees who have a CRM ID. 
+
+```{r set_found_unfound}
+#Switch to directory with master attendees file
+setwd(wd)
+found <- read.csv(paste0(fileName, ".csv"), na.strings =c("", "#NA", "<N/A>", "<NA>", "N/A"), 
+                            strip.white=TRUE, 
+                            stringsAsFactors=FALSE)
+
+found$Program <- as.factor(toupper(found$Program))
+found$Year <- as.integer(found$Year)
+found$Match.Similarity <- NA
+
+table(is.na(found$CRM.ID))
+# Split into unfound and not unfound
+unfound<- found[is.na(found['CRM.ID']),]
+found <- found[!is.na(found['CRM.ID']),]
+# Add column to record method for matching ID
+unfound$Match.Method = "Not Matched"
+found <- dplyr::mutate(found, Match.Method="Given")
+```
+
+## Get Reference Data
+### Reading Data From All Degrees File
+
+The first place we'll get data from is the All Degrees [^1] file. We only want a few of the 183 columns.
+
+
+```{r get_crm_name_deg}
+#Getting the data 
+##Get email name and degree data from CRM using All Degrees file
+wd <- "K:\\Ard\\Alumni Relations\\Data Management\\DPR\\Updated All Degrees File"
+setwd(wd)
+ecrm <- read.csv(allDegreesExtract, na.strings =c("", "#NA", "<N/A>", "<NA>", "N/A"), strip.white=TRUE)
+ifelse("Program" %in% names(ecrm), alumCols <- c("CONSTITUENTLOOKUPID", "FIRSTNAME", "LAST_NAME",
+                                                "DEGREE1_YEAR", "DEGREE1_CODE","DEGREE1_MAJOR_CODE",
+                                                "HOME_EMAILADDRESS", "BUSINESS_EMAILADDRESS", "Program"),
+       alumCols <- c("CONSTITUENTLOOKUPID", "FIRSTNAME", "LAST_NAME",
+                                                "DEGREE1_YEAR", "DEGREE1_CODE","DEGREE1_MAJOR_CODE",
+                                                "HOME_EMAILADDRESS", "BUSINESS_EMAILADDRESS"))
+ecrm <- ecrm[alumCols]
+#ecrm$Program <- ifelse("Program" %in% names(ecrm), )
+
+```
+
+### Connecting to TOAD & CRM 
+Next we'll connect to and query the alumni SQL Server[^2] for more reference data -- names and email -- to include in our lookup table. 
+
+```{r get_toad_name_email}
+
+dbhandle <- odbcDriverConnect('driver={SQL Server};
+                              server=sqldb.anderson.ucla.edu;
+                              database=alumni;
+                              trusted_connection=true')
+##Use connection to select all active emails and corresponding CRM ID's 
+sqlString <- "SELECT a.id,a.fname, a.mname, a.lname, a.preferred_name, d.type, d.email
+              FROM alum_agsmdata AS a JOIN alum_address AS d 
+                ON a.id = d.id JOIN alum_edu e ON e.id = a.id
+              WHERE d.status ='A'"
+
+toad_email <- unique(sqlQuery(dbhandle, sqlString))
+
+```
+
+### Reshape TOAD Email data 
+
+The toad_email dataframe is generated from the alum_address table where each email is a record. For our purposes we want on record per constituent so we'll reshape the table. We're also interested in past emails which are stored in the alum_email_log along with LEF's from the student_data_corrections table so we'll query those tables and store the results to the 'all_emails' dataframe. 
+
+```{r get_toad_email2}
+##Reshape data to fit All Degrees file format
+toad_email <- dcast(toad_email, id + fname + mname + lname + preferred_name ~ type, value.var = "email")
+##Get all emails from email log
+sqlString <- "SELECT ISNULL(l.id, lef.advance_id) AS id, lef.correction_data,l.old_email, l.new_email
+              FROM alum_email_log l FULL OUTER JOIN
+                  (SELECT s.advance_id, s.correction_data
+                  FROM student_data_corrections s
+                  WHERE s.correction_field LIKE 'email%') lef
+              ON lef.advance_id = l.id"
+
+all_emails <- unique(sqlQuery(dbhandle, sqlString))
+all_emails$crm_id <- as.integer(as.character(all_emails$id))
+
+```
+## Putting it All Together
+
+We now have all the external data we'll need for our ID matching. But we'll want to 
+
+ 1. standardize column names in reference data,
+ 2. make all strings lower case both reference and attendee data, and
+ 3. generate a few possible LEF's for reference name/degree data
+ 
+ 
+
+```{r format_attendees}
+##Merge TOAD and CRM dataframes using alumni ID's
+alumni <- merge(toad_email, ecrm, by.x = "id", by.y="CONSTITUENTLOOKUPID", all.y=TRUE)
+##Rename columns makes reading algorithm easier
+alumni <- plyr::rename(alumni, c("HOME_EMAILADDRESS" = "crm_h_email", "LAST_NAME" = "crm_last_name",
+                                "FIRSTNAME" = "crm_first_name", "BUSINESS_EMAILADDRESS" = "crm_b_email",
+                                "B" = "toad_b_email", "H"="toad_h_email", "P"="toad_p_email",
+                                "fname" = "toad_first_name", "lname" = "toad_last_name", "mname" = "toad_middle_name"))
+
+##Lowercase all text columns 
+charCols <- c("toad_first_name", "toad_last_name", "toad_middle_name", "preferred_name", 
+              "toad_b_email", "toad_h_email", "toad_p_email", "crm_h_email", "crm_b_email",
+              "crm_last_name", "crm_first_name")
+alumni[,charCols] <- lapply(alumni[,charCols], tolower)
+charCols <- c("First.Name", "Last.Name", "Email")
+unfound[,charCols] <- lapply(unfound[,charCols], tolower)
+alumni <- transform(alumni, toad_last_name = colsplit(toad_last_name, pattern = " ", names = c('a', 'b', 'c', 'd', 'e')))
+alumni$toad_last_name_full <- gsub(" ", "", paste0(alumni$toad_last_name$a, alumni$toad_last_name$b, alumni$toad_last_name$c, 
+                                                   alumni$toad_last_name$d, alumni$toad_last_name$e))
+##Create Anderson Email account for each alumni's by concatenating firstName.lastName.degreeYear@anderson.ucla.edu
+alumni$anderson_email <-  gsub(" ", "", tolower(paste0(alumni$toad_first_name, ".", alumni$toad_last_name$a, alumni$toad_last_name$b, 
+                               alumni$toad_last_name$c, alumni$toad_last_name$d, alumni$toad_last_name$e,
+                               alumni$toad_last_name$f,".",alumni$DEGREE1_YEAR, "@anderson.ucla.edu")))
+alumni$anderson_email2 <- tolower(paste0(alumni$toad_first_name, ".", alumni$toad_last_name$a, 
+                                        ".",alumni$DEGREE1_YEAR, "@anderson.ucla.edu"))
+alumni$anderson_email3 <- gsub(" ", "", tolower(paste0(alumni$toad_first_name, ".", alumni$toad_last_name$a, alumni$toad_last_name$b, 
+                                                       alumni$toad_last_name$c,".",alumni$DEGREE1_YEAR, "@anderson.ucla.edu")))
+
+alumni$anderson_email4 <-  gsub(" ", "", tolower(paste0(alumni$toad_first_name, ".", alumni$toad_last_name$a, alumni$toad_last_name$b, 
+                                                       alumni$toad_last_name$c, alumni$toad_last_name$d,
+                                                       ".",alumni$DEGREE1_YEAR, "@anderson.ucla.edu")))
+alumni$anderson_email5 <- tolower(paste0(alumni$preferred_name, ".", alumni$toad_last_name$a, ".",
+                                         alumni$DEGREE1_YEAR, "@anderson.ucla.edu"))
+
+kable(alumni[1:5,c(1:3, 5:22)], caption="Our reference table")
+```
+# Matching Alumni ID's
+
+In the first stage of matching we'll loop over each attendee record and search our reference[^3] data for a matching email. If we don't find the attendee's email we'll then look for the name, degree and program they provided. If we get one result, the corresponding CRM ID is written in the CRM.ID field of the unfound dataframe. 
+
+## Email Lookups
+
+Now that our reference/lookup table is set up we'll loop over all the attendee records and if we're able to find a unique match in any of our existing email databases we'll write the corresonding CRM ID to our unfound file.
+
+```{r lookup_emails}
+records <- dim(unfound)[[1]]
+for(i in seq(dim(unfound)[[1]])){
+  if(i%%100 == 0){
+    print("")
+    searched <- round(i/records,3)*100
+    f <- round(table(is.na(unfound$CRM.ID))[1]/records, 3)*100
+    print(paste0(searched, "% of records searched, ", f, "% Total ID's located"))
+  }
+   email <- as.character(unfound[i, "Email"])
+   m <- subset(alumni, toad_b_email == email  | toad_h_email == email | toad_p_email == email |
+               crm_h_email == email | crm_b_email == email)
+  if(dim(m)[1]== 1){
+      id <- m[['id']]
+      unfound[i,'CRM.ID'] = id
+      unfound[i, 'Match.Method'] = 'Email Matched - Current'
+    next
+  }
+  m <- unique(subset(all_emails, old_email == email | new_email == email)[,c("id", "crm_id")])
+  if(dim(m)[1] == 1){
+    if(m[['crm_id']] %in% alumni[['id']]){
+      id <- m[['crm_id']]
+      unfound[i,'CRM.ID'] = id
+      unfound[i, 'Match.Method'] = 'Email Matched - past email'
+      next
+    }
+  }
+  m <- subset(alumni, anderson_email == email | anderson_email2 == email |
+                anderson_email3 == email | anderson_email4 == email | anderson_email5 == email)
+  if(dim(m)[1]==1){
+    if(m[['id']] %in% alumni[['id']]){
+      id <- m[['id']]
+      unfound[i,'CRM.ID'] = id
+      unfound[i, 'Match.Method'] = 'Email Matched - LEF'
+    next
+      }
+  }
+  m <- subset(all_emails, correction_data == email)
+  if(dim(m)[1] ==1){
+    if(m[['id']] %in% alumni[['id']]){
+      id <- m[['id']]
+      unfound[i,'CRM.ID'] = id
+      unfound[i, 'Match.Method'] = 'Email Matched - LEF student corrections'
+      next
+    }
+  }
+  }
+```
+
+## Append Matched Records to Found, Filter From Unfound
+
+We'll now split the records we found off the unfound dataframe and append them to the found dataframe. We'll also pring off a table of the results from the lookup.
+
+
+```{r split_found}
+##Check how many ID's found
+unfound %>% select(CRM.ID, Match.Method) %>%
+            filter(!is.na(CRM.ID)) %>%
+            group_by(Match.Method) %>%
+            summarise(number_of_matches=n()) %>%
+            kable(caption="Match Results")
+
+##Remove found records and append to found
+found <- unfound %>%
+                  filter(!is.na(CRM.ID)) %>%
+                  bind_rows(found)
+
+unfound <- filter(unfound, is.na(CRM.ID))
+```
+
+## By Name, Degree, Program and Year
+
+The next loop searches the remaining unfound records and looks for unique, exact matches in the reference data for
+
+ 1.First Name, Last Name Program & Year
+ 2.First Name, Last Name Program
+ 3.First Name, Last Name Year
+ 4.First Name Contains Last Name Contains Program
+ 
+If any of the above criteria leads to an exact match in the alumni reference data the corresponding CRM ID is written to the unfound dataframe.
+
+```{r lookup_name_deg_prog}
+records <- dim(unfound)[[1]]
+for(i in seq(dim(unfound)[[1]])){
+  if(i%%100 == 0){
+    print("")
+    searched <- round(i/records,3)*100
+    f <- round(table(is.na(unfound$CRM.ID))[1]/records, 3)*100
+    print(paste0(searched, "% of records searched, ", f, "% Total ID's located"))
+  }
+  fname <- unfound[i,"First.Name"]
+  lname <- unfound[i, "Last.Name"]
+  lname2 <-""
+  #Check for multiple last names
+  if(!is.na(strsplit(lname, " ")[[1]][2])){
+    f <-strsplit(lname, " ")[[1]][1]
+    lname2 <-strsplit(lname, " ")[[1]][2]
+    lname <- f
+  }
+  year <- unfound[i, "Year"]
+  if(is.na(year)){year<-""}
+  program <- as.character(unfound[i, "Program"])
+  if(is.na(program)){program <- ""}
+  #Last Name Exact Match and Preferred or First Name Exact Match
+  if(lname2==""){m <- subset(alumni, (toad_last_name$a == lname | toad_last_name$b == lname | crm_last_name == lname ) & 
+                                (crm_first_name ==fname | preferred_name == fname))}
+  else{m <- subset(alumni, (crm_last_name == lname | crm_last_name == lname2 | toad_last_name$a %in% c(lname, lname2) | 
+                              toad_last_name$b %in% c(lname, lname2)) & 
+                      (toad_first_name == fname | crm_first_name== fname))}
+  
+  m2 <- subset(m, Program == program | DEGREE1_YEAR == year)
+  if(dim(m2)[1]==1){
+    if(m2[['Program']] == program & m2[['DEGREE1_YEAR']] == year){
+      unfound[i,'CRM.ID'] = m2[['id']]
+      unfound[i, 'Match.Method'] = 'First Name, Last Name Program Year'
+      next
+    }
+    if(m2[['Program']] == program){
+      unfound[i,'CRM.ID'] = m2[['id']]
+      unfound[i, 'Match.Method'] = 'First Name, Last Name Program'
+      next
+    }
+    if(m2[['DEGREE1_YEAR']] == year){
+      unfound[i,'CRM.ID'] = m2[['id']]
+      unfound[i, 'Match.Method'] = 'First Name, Last Name Year'
+      next
+    }
+  }
+  else{
+     if(dim(m2)[1]>1){
+      if(dim(m2[m2$DEGREE1_YEAR==year,])[1]==1){
+        m2 <- m2[m2$DEGREE1_YEAR == year,]
+        unfound[i,'CRM.ID'] = m2[['id']]
+        unfound[i, 'Match.Method'] = 'First Name, Last Name Year'
+        next
+      }
+     }
+    }
+  m<- subset(alumni, grepl(lname, crm_last_name) & 
+               (grepl(fname, crm_first_name) |  grepl(fname, preferred_name)))
+  if(dim(m)[1]==1){
+    if(m[['Program']] == program){
+      unfound[i,'CRM.ID'] = m[['id']]
+      unfound[i, 'Match.Method'] = 'First Name Contains Last Name Contains Program'
+      next 
+    }
+    if(m[['DEGREE1_YEAR']] == year){
+      unfound[i,'CRM.ID'] = m[['id']]
+      unfound[i, 'Match.Method'] = 'First Name, Last Name Year'
+      next 
+    }
+  }
+}
+  
+```
+
+## Append Records to Found, Filter From Unfound
+We again split the records we found off the unfound dataframe and append them to the found dataframe and print a table of the results from the lookup.
+
+```{r split_found2}
+##Check how many ID's found
+unfound %>% select(CRM.ID, Match.Method) %>%
+            filter(!is.na(CRM.ID)) %>%
+            group_by(Match.Method) %>%
+            summarise(number_of_matches=n()) %>%
+            kable(caption="Match Results")
+##Remove found records and append to found
+found <- unfound %>%
+                  filter(!is.na(CRM.ID)) %>%
+                  bind_rows(found)
+
+unfound <- filter(unfound, is.na(CRM.ID))
+```
+
+## Similarity Measures 
+
+In past iterations of this project we noticed cases where attendees were matched incorrectly to someone in our reference data. The root issue was attendees using the email of an alumni to register for an event. It's a rare scenario, but to account for the possibility the last step is to add a similarity measure between the name provided by the attendee and the name of the constituent we matched them to. 
+
+In practice we've noticed similarity measures of less than .5 are a "red flag" to double check the match, but more testing needs to be done to clearly define how we interperet them.
+
+```{r sim_meas}
+#Add match similarity measure for all matched ID's and the name of the constituent they were matched to
+for(i in seq(dim(found)[[1]])){
+    id <- found[i,'CRM.ID']
+    attendeeName <- paste0(found[i,'First.Name'], found[i,'Last.Name'])
+    formalName <- paste0(alumni[alumni$id==id, 'toad_first_name'], alumni[alumni$id == id, 'toad_last_name'])
+    formalName2 <- paste0(alumni[alumni$id==id, 'crm_first_name'], alumni[alumni$id == id, 'crm_last_name'])
+    informalName <- paste0(alumni[alumni$id==id, 'preferred_name'], alumni[alumni$id == id, 'toad_last_name'])
+    informalName2 <- paste0(alumni[alumni$id==id, 'preferred_name'], alumni[alumni$id==id, 'crm_last_name'])
+    middleLast <- paste0(alumni[alumni$id == id, 'toad_middle_name'], alumni[alumni$id==id, 'crm_last_name'])
+    
+    sim <- max(1-stringdist(formalName,attendeeName, method='jaccard'),
+               1-stringdist(formalName2,attendeeName, method='jaccard'),
+               1-stringdist(informalName,attendeeName, method='jaccard'),
+               1-stringdist(informalName2,attendeeName, method='jaccard'),
+               1-stringdist(middleLast, attendeeName, method = 'jaccard'))
+    
+    found[i,'Match.Similarity'] = sim
+  }
+```
+
+# Results
+It's commented out here but at this point results are written to the results directory.
+
+```{r write_results}
+#setwd(resultsDirectory)
+#write.csv(found, paste0(resultFileName,"v",Sys.Date() , ".csv"), row.names=FALSE)
+#write.csv(unfound, paste0('unable_to_match_v',Sys.Date(), '.csv'), row.names=FALSE)
+```
+ 
+[^1]: The All Degrees file is a report from External Affairs updated monthly and stored as both a csv and .xlxs file on the OAR shared drive.
+[^2]: The server name is sqldb.anderson.ucla.edu.alumni. ACIS controls access; Once you have access you can use your ANET username & password.
+[^3]: Typically looping over rows of a dataframe is a bad idea in R, so you're welcome to try to improve/simplify the lookup. 
